@@ -1,0 +1,17 @@
+[Unit]
+Description=rclone: Remote FUSE filesystem for cloud storage config %i
+Documentation=man:rclone(1)
+After=network-online.target
+Wants=network-online.target
+AssertPathIsDirectory=/mnt/gcs_mount/
+
+[Service]
+Type=notify
+ExecStartPre=/bin/mkdir -p /mnt/gcs_mount/%i
+ExecStart=/usr/bin/rclone mount --config /etc/rclone/rclone.conf --allow-non-empty --allow-other --vfs-cache-max-size 300M --dir-cache-time 24h --vfs-read-chunk-size-limit 128M --vfs-read-chunk-size-limit off --log-level INFO --log-file /var/log/rclone/rclone-%i.log --bwlimit 20M --umask 022 gcp_oss_consul:%i /mnt/gcs_mount/%i
+ExecStop=/bin/fusermount -uz /mnt/gcs_mount/%i
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

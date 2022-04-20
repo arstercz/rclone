@@ -15,7 +15,10 @@ FIXME Patch/Delete/Get isn't working with files with spaces in - giving 404 erro
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"encoding/hex"
+	"crypto/aes"
+	"crypto/cipher"
 	"errors"
 	"fmt"
 	"io"
@@ -43,6 +46,7 @@ import (
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/googleapi"
+	consulapi "github.com/hashicorp/consul/api"
 
 	// NOTE: This API is deprecated
 	storage "google.golang.org/api/storage/v1"
@@ -77,10 +81,11 @@ func init() {
 		Description: "Google Cloud Storage (this is not Google Drive)",
 		NewFs:       NewFs,
 		Config: func(ctx context.Context, name string, m configmap.Mapper, config fs.ConfigIn) (*fs.ConfigOut, error) {
+			saConsul, _ := m.Get("service_consul_key")
 			saFile, _ := m.Get("service_account_file")
 			saCreds, _ := m.Get("service_account_credentials")
 			anonymous, _ := m.Get("anonymous")
-			if saFile != "" || saCreds != "" || anonymous == "true" {
+			if saFile != "" || saCreds != "" || saConsul != "" || anonymous == "true" {
 				return nil, nil
 			}
 			return oauthutil.ConfigOut("", &oauthutil.Options{
@@ -97,6 +102,19 @@ func init() {
 			Name: "service_account_credentials",
 			Help: "Service Account Credentials JSON blob.\n\nLeave blank normally.\nNeeded only if you want use SA instead of interactive login.",
 			Hide: fs.OptionHideBoth,
+		}, {
+			Name: "service_consul_server",
+			Help: "Consul server to get credentials.",
+		}, {
+			Name: "service_consul_token",
+			Help: "Consul token to access credenticals.",
+		}, {
+			Name: "service_consul_key",
+			Help: "Consul key to access credenticals",
+		}, {
+			Name: "service_consul_tls",
+			Help: "Whether use tls or not when to connect consul.",
+			Default: false,
 		}, {
 			Name:    "anonymous",
 			Help:    "Access public buckets and objects without credentials.\n\nSet to 'true' if you just want to download files and don't configure credentials.",
@@ -311,6 +329,10 @@ type Options struct {
 	ProjectNumber             string               `config:"project_number"`
 	ServiceAccountFile        string               `config:"service_account_file"`
 	ServiceAccountCredentials string               `config:"service_account_credentials"`
+	ServiceConsulServer       string               `config:"service_consul_server"`
+	ServiceConsulToken        string               `config:"service_consul_token"`
+	ServiceConsulKey          string               `config:"service_consul_key"`
+	ServiceConsulTls          bool                 `config:"service_consul_tls"`
 	Anonymous                 bool                 `config:"anonymous"`
 	ObjectACL                 string               `config:"object_acl"`
 	BucketACL                 string               `config:"bucket_acl"`
@@ -435,9 +457,107 @@ func (f *Fs) setRoot(root string) {
 	f.rootBucket, f.rootDirectory = bucket.Split(f.root)
 }
 
+// get the key's content from consul, and decrypt with key
+func ReadConsulKey(server string, token string, key string, tls bool) (map[string]interface{}, error) {
+	tlsConfig := &consulapi.TLSConfig{}
+	scheme := "http"
+	timeout := 5 * time.Second
+
+	if tls {
+		scheme = "https"
+
+		tlsConfig = &consulapi.TLSConfig{
+			CertFile: "/etc/telegraf/tls/client-cert.pem",
+			KeyFile:  "/etc/telegraf/tls/client-key.pem",
+			CAFile:   "/etc/telegraf/tls/ca.pem",
+			InsecureSkipVerify: true,
+		}
+	}
+
+	consulConfig := &consulapi.Config{
+		Address:	server,
+		Token:		token,
+		WaitTime:	timeout,
+		Scheme:		scheme,
+		TLSConfig:	*tlsConfig,
+	}
+
+	client, err := consulapi.NewClient(consulConfig)
+	if err != nil {
+		return nil, fmt.Errorf("error connect consul: %w", err)
+	}
+
+
+	consulkey := fmt.Sprintf("oss/gcp/%s", key)
+	kv := client.KV()
+	pair, _, err := kv.Get(consulkey,
+		&consulapi.QueryOptions{
+			AllowStale: true,
+			Token: token,
+			WaitTime: timeout,
+		})
+
+	if err != nil {
+		return nil, fmt.Errorf("error get consul key: %w", err)
+	}
+
+	if pair == nil {
+		return nil, fmt.Errorf("error no key exists at consul: %w", err)
+	}
+
+	var dat map[string]interface{}
+	err = json.Unmarshal([]byte(pair.Value), &dat)
+	if err != nil {
+		return nil, fmt.Errorf("error unmarkshal error: %w", err)
+	}
+
+	return dat, nil
+}
+
+func ConsulAllowBucket(lists []interface{}, bucket string) bool {
+	if bucket == "" {
+		return false
+	}
+
+	for _, v := range lists {
+		if v.(string) == "allow_all" {
+			return true
+		}
+
+		if bucket == v.(string) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func DecryptFromConsul(text []byte, key []byte) ([]byte, error) {
+	ciphertext, _ := hex.DecodeString(string(text))
+
+	c, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+
+	gcm, err := cipher.NewGCM(c)
+	if err != nil {
+		return nil, err
+	}
+
+	nonceSize := gcm.NonceSize()
+	if len(ciphertext) < nonceSize {
+		return nil, fmt.Errorf("ciphertext too short")
+	}
+
+	nonce, ciphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]
+	return gcm.Open(nil, nonce, ciphertext, nil)
+}
+
 // NewFs constructs an Fs from the path, bucket:path
 func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
 	var oAuthClient *http.Client
+	var consuldata map[string]interface{}
 
 	// Parse config into Options struct
 	opt := new(Options)
@@ -452,6 +572,20 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		opt.BucketACL = "private"
 	}
 
+	// we should disable ServiceAccountFile when enable consul
+	if opt.ServiceConsulKey != "" {
+		opt.ServiceAccountFile = ""
+		consuldata, err = ReadConsulKey(opt.ServiceConsulServer, opt.ServiceConsulToken, opt.ServiceConsulKey, opt.ServiceConsulTls)
+		if err != nil {
+			return nil, fmt.Errorf("error opening service account from consul: %w", err)
+		}
+
+		decryptCreds, err := DecryptFromConsul([]byte(consuldata["service_account"].(string)), []byte(opt.ServiceConsulKey))
+		if err != nil {
+			return nil, fmt.Errorf("error decrypt consul service account: %w", err)
+		}
+		opt.ServiceAccountCredentials = string(decryptCreds)
+	}
 	// try loading service account credentials from env variable, then from a file
 	if opt.ServiceAccountCredentials == "" && opt.ServiceAccountFile != "" {
 		loadedCreds, err := ioutil.ReadFile(env.ShellExpand(opt.ServiceAccountFile))
@@ -498,6 +632,10 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	f.svc, err = storage.New(f.client)
 	if err != nil {
 		return nil, fmt.Errorf("couldn't create Google Cloud Storage client: %w", err)
+	}
+
+	if !ConsulAllowBucket(consuldata["buckets"].([]interface{}), f.rootBucket) {
+		return nil, fmt.Errorf("bucket %s is not allowed in consul buckets", f.rootBucket)
 	}
 
 	if f.rootBucket != "" && f.rootDirectory != "" {
