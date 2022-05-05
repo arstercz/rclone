@@ -1,0 +1,110 @@
+#!/bin/sh
+#
+# rclone        init file for starting up the rclone daemon
+#
+# chkconfig: - 50 50
+# description: Starts and stops the rclone daemon.
+
+# Source function library.
+
+name="rclone"
+bucket="$2"
+
+[ "$bucket" ] || {
+  echo "must set bucket name"
+  exit 1
+}
+
+exec="/usr/bin/$name"
+RCLONE_CONFIG="/etc/rclone/rclone.conf"
+lockfile="/var/lock/rclone_${bucket}"
+
+[ -d "/var/log/rclone" ] || mkdir -p /var/log/rclone
+[ -d "/mnt/gcs_mount/$bucket" ] || mkdir -p /mnt/gcs_mount/$bucket
+
+[ -e /etc/sysconfig/rclone ] && . /etc/sysconfig/rclone
+
+_pidofpattern() {
+  local pattern="$1"
+  pgrep -f "$pattern" 2>/dev/null
+}
+
+start() {
+    [ -f $REDIS_CONFIG ] || exit 6
+    [ -x $exec ] || exit 5
+    echo -n $"Starting ${name}@${bucket}: "
+    nohup $exec mount --config $RCLONE_CONFIG --allow-non-empty --allow-other --vfs-cache-max-size 300M --dir-cache-time 24h --vfs-read-chunk-size-limit 128M --vfs-read-chunk-size-limit off --log-level INFO --log-file /var/log/rclone/rclone-${bucket}.log --umask 022 gcp_oss_consul:${bucket} /mnt/gcs_mount/${bucket} >>/var/log/rclone/start_${bucket}.log 2>&1 &
+    retval=$?
+    echo
+    sleep 1
+    [ $retval -eq 0 ] &&  touch $lockfile
+    pid=$(_pidofpattern "gcp_oss_consul:${bucket}")
+    if [ "$pid" ]; then
+        echo "start ${name}@${bucket} ok."
+    else
+        echo "start ${name}@${bucket} error"
+	retval=1
+    fi
+    return $retval
+}
+
+stop() {
+    echo -n $"Stopping ${name}@${bucket}: "
+    /bin/fusermount -uz /mnt/gcs_mount/${bucket}
+    retval=$?
+
+    sleep 1
+    pid=$(_pidofpattern "gcp_oss_consul:${bucket}")
+    if [ "$pid" ]
+    then
+        # shutdown haven't work, try old way
+        kill $pid
+        retval=$?
+    else
+        echo "${name}@${bucket} shutdown"
+    fi
+    echo
+    [ $retval -eq 0 ] && rm -f $lockfile
+    return $retval
+}
+
+restart() {
+    stop
+    start
+}
+
+rh_status() {
+    pid=$(_pidofpattern "gcp_oss_consul:${bucket}")
+    if [ "$pid" ]; then
+      echo "${name}@${bucket}($pid) is running."
+      return 0
+    else
+      echo "${name}@${bucket} is not running."
+      return 1
+    fi
+}
+
+rh_status_q() {
+    rh_status >/dev/null 2>&1
+}
+
+case "$1" in
+    start)
+        rh_status_q && exit 0
+        $1
+        ;;
+    stop)
+        rh_status_q || exit 0
+        $1
+        ;;
+    restart)
+        $1
+        ;;
+    status)
+        rh_status
+        ;;
+    *)
+        echo $"Usage: $0 {start srv|stop srv|status srv|restart srv}"
+        exit 2
+esac
+exit $?

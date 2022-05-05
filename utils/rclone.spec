@@ -26,6 +26,7 @@ License:        MIT
 URL:            https://rclone.org
 Source0:        %{name}-%{version}.tar.gz
 BuildRoot:      %{_tmppath}/%{name}-%{version}-%{release}-root-%(%{__id_u} -n)
+BuildArch:      noarch
 
 %if %{with_systemd}
 Requires(post):   systemd-units
@@ -37,6 +38,8 @@ Requires(preun): /sbin/chkconfig, /sbin/service
 Requires(postun): /sbin/service
 %endif
 Requires:  fuse
+
+%define _binaries_in_noarch_packages_terminate_build   0
 
 %description
 "rsync for cloud storage" - Google Drive, S3, Dropbox, Backblaze B2, 
@@ -58,7 +61,11 @@ install -Dp -m0755 bin/rclone %{buildroot}%{_bindir}/rclone
 install -Dp -m0755 bin/aesutils %{buildroot}%{_bindir}/aesutils
 install -Dp -m0755 bin/uniqsign %{buildroot}%{_bindir}/uniqsign
 install -Dp -m0644 etc/rclone.conf %{buildroot}%{_sysconfdir}/rclone/%{name}.conf
+%if %{with_systemd}
 install -Dp -m0644 systemd/rclone@.service %{buildroot}%{_unitdir}/%{name}@.service
+%else
+install -Dp -m0644 init/rclone.init %{buildroot}%{_initrddir}/%{name}
+%endif
 
 %clean
 [ "%{buildroot}" != "/" ] && rm -rf %{buildroot}
