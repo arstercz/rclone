@@ -7,8 +7,11 @@ import (
 	"crypto/md5"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/json"
 	"encoding/hex"
 	"encoding/xml"
+	"crypto/aes"
+	"crypto/cipher"
 	"errors"
 	"fmt"
 	"io"
@@ -52,6 +55,7 @@ import (
 	"github.com/rclone/rclone/lib/rest"
 	"github.com/rclone/rclone/lib/structs"
 	"golang.org/x/sync/errgroup"
+	consulapi "github.com/hashicorp/consul/api"
 )
 
 // Register with Fs
@@ -135,6 +139,19 @@ func init() {
 		}, {
 			Name: "secret_access_key",
 			Help: "AWS Secret Access Key (password).\n\nLeave blank for anonymous access or runtime credentials.",
+		}, {
+			Name: "service_consul_server",
+			Help: "Consul server to get credentials.",
+		}, {
+			Name: "service_consul_token",
+			Help: "Consul token to access credenticals.",
+		}, {
+			Name: "service_consul_key",
+			Help: "Consul key to access credenticals.",
+		}, {
+			Name: "service_consul_tls",
+			Help: "Whether use tls or not when to connect consul.",
+			Default: false,
 		}, {
 			// References:
 			// 1. https://docs.aws.amazon.com/general/latest/gr/rande.html
@@ -1599,6 +1616,10 @@ type Options struct {
 	EnvAuth               bool                 `config:"env_auth"`
 	AccessKeyID           string               `config:"access_key_id"`
 	SecretAccessKey       string               `config:"secret_access_key"`
+	ServiceConsulServer   string               `config:"service_consul_server"`
+	ServiceConsulToken    string               `config:"service_consul_token"`
+	ServiceConsulKey      string               `config:"service_consul_key"`
+	ServiceConsulTls      bool                 `config:"service_consul_tls"`
 	Region                string               `config:"region"`
 	Endpoint              string               `config:"endpoint"`
 	LocationConstraint    string               `config:"location_constraint"`
@@ -2041,8 +2062,107 @@ func (f *Fs) setRoot(root string) {
 	f.rootBucket, f.rootDirectory = bucket.Split(f.root)
 }
 
+// get the key's content from consul, and decrypt with key
+func ReadConsulKey(server string, token string, key string, tls bool) (map[string]interface{}, error) {
+	tlsConfig := &consulapi.TLSConfig{}
+	scheme := "http"
+	timeout := 5 * time.Second
+
+	if tls {
+		scheme = "https"
+
+		tlsConfig = &consulapi.TLSConfig{
+			CertFile: "/etc/telegraf/tls/client-cert.pem",
+			KeyFile:  "/etc/telegraf/tls/client-key.pem",
+			CAFile:   "/etc/telegraf/tls/ca.pem",
+			InsecureSkipVerify: true,
+		}
+	}
+
+	consulConfig := &consulapi.Config{
+		Address:	server,
+		Token:		token,
+		WaitTime:	timeout,
+		Scheme:		scheme,
+		TLSConfig:	*tlsConfig,
+	}
+
+	client, err := consulapi.NewClient(consulConfig)
+	if err != nil {
+		return nil, fmt.Errorf("error connect consul: %w", err)
+	}
+
+
+	consulkey := fmt.Sprintf("oss/s3/%s", key)
+	kv := client.KV()
+	pair, _, err := kv.Get(consulkey,
+		&consulapi.QueryOptions{
+			AllowStale: true,
+			Token: token,
+			WaitTime: timeout,
+		})
+
+	if err != nil {
+		return nil, fmt.Errorf("error get consul key: %w", err)
+	}
+
+	if pair == nil {
+		return nil, fmt.Errorf("error no key exists at consul: %w", err)
+	}
+
+	var dat map[string]interface{}
+	err = json.Unmarshal([]byte(pair.Value), &dat)
+	if err != nil {
+		return nil, fmt.Errorf("error unmarkshal error: %w", err)
+	}
+
+	return dat, nil
+}
+
+func ConsulAllowBucket(lists []interface{}, bucket string) bool {
+	if bucket == "" {
+		return false
+	}
+
+	for _, v := range lists {
+		if v.(string) == "allow_all" {
+			return true
+		}
+
+		if bucket == v.(string) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func DecryptFromConsul(text []byte, key []byte) ([]byte, error) {
+	ciphertext, _ := hex.DecodeString(string(text))
+
+	c, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+
+	gcm, err := cipher.NewGCM(c)
+	if err != nil {
+		return nil, err
+	}
+
+	nonceSize := gcm.NonceSize()
+	if len(ciphertext) < nonceSize {
+		return nil, fmt.Errorf("ciphertext too short")
+	}
+
+	nonce, ciphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]
+	return gcm.Open(nil, nonce, ciphertext, nil)
+}
+
 // NewFs constructs an Fs from the path, bucket:path
 func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
+	var consuldata map[string]interface{}
+
 	// Parse config into Options struct
 	opt := new(Options)
 	err := configstruct.Set(m, opt)
@@ -2062,6 +2182,25 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 	if opt.BucketACL == "" {
 		opt.BucketACL = opt.ACL
+	}
+	// we should handle access_key and access_key_secret when enable consul
+	if opt.ServiceConsulKey != "" {
+		consuldata, err = ReadConsulKey(opt.ServiceConsulServer, opt.ServiceConsulToken, opt.ServiceConsulKey, opt.ServiceConsulTls)
+		if err != nil {
+			return nil, fmt.Errorf("error opening service account from consul: %w", err)
+		}
+
+		decryptKeyId, err := DecryptFromConsul([]byte(consuldata["access_key_id"].(string)), []byte(opt.ServiceConsulKey))
+		if err != nil {
+			return nil, fmt.Errorf("error decrypt consul access_key_id: %w", err)
+		}
+		opt.AccessKeyID = strings.TrimSuffix(string(decryptKeyId), "\n")
+
+		decryptKeySecret, err := DecryptFromConsul([]byte(consuldata["secret_access_key"].(string)), []byte(opt.ServiceConsulKey))
+		if err != nil {
+			return nil, fmt.Errorf("error decrypt consul secret_access_key: %w", err)
+		}
+		opt.SecretAccessKey = strings.TrimSuffix(string(decryptKeySecret), "\n")
 	}
 	if opt.SSECustomerKey != "" && opt.SSECustomerKeyMD5 == "" {
 		// calculate CustomerKeyMD5 if not supplied
@@ -2119,6 +2258,11 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		GetTier:           true,
 		SlowModTime:       true,
 	}).Fill(ctx, f)
+
+	if !ConsulAllowBucket(consuldata["buckets"].([]interface{}), f.rootBucket) {
+		return nil, fmt.Errorf("bucket %s is not allowed in consul buckets", f.rootBucket)
+	}
+
 	if f.rootBucket != "" && f.rootDirectory != "" && !opt.NoHeadObject && !strings.HasSuffix(root, "/") {
 		// Check to see if the (bucket,directory) is actually an existing file
 		oldRoot := f.root

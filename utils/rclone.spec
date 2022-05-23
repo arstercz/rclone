@@ -55,12 +55,13 @@ Requires:  fuse
 %install
 mkdir -p %{buildroot}/etc/rclone
 mkdir -p %{buildroot}/var/log/rclone
-mkdir -p %{buildroot}/mnt/gcs_mount
+mkdir -p %{buildroot}/mnt/rclone_mount
 
 install -Dp -m0755 bin/rclone %{buildroot}%{_bindir}/rclone
 install -Dp -m0755 bin/aesutils %{buildroot}%{_bindir}/aesutils
 install -Dp -m0755 bin/uniqsign %{buildroot}%{_bindir}/uniqsign
 install -Dp -m0644 etc/rclone.conf %{buildroot}%{_sysconfdir}/rclone/%{name}.conf
+
 %if %{with_systemd}
 install -Dp -m0644 systemd/rclone@.service %{buildroot}%{_unitdir}/%{name}@.service
 %else
@@ -87,7 +88,7 @@ Thanks for using rclone!
 installed in:
 
   /etc/rclone/rclone.conf            # config option
-  /mnt/gcs_mount                     # mount dir for all bucket
+  /mnt/rclone_mount                  # mount dir for all bucket
   /var/log/rclone/                   # rclone log dir
   systemctl enable rclone@bucketname # enable rclone mount
   systemctl start rclone@bucketname  # start rclone mount
@@ -104,7 +105,7 @@ BANNER
 
 %files
 %defattr(-,root,root,-)
-%dir %attr(750,root,root) /mnt/gcs_mount
+%dir %attr(750,root,root) /mnt/rclone_mount
 %dir %attr(750,root,root) /var/log/rclone
 %dir %attr(750,root,root) /etc/rclone
 

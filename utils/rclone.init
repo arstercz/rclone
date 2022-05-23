@@ -20,7 +20,7 @@ RCLONE_CONFIG="/etc/rclone/rclone.conf"
 lockfile="/var/lock/rclone_${bucket}"
 
 [ -d "/var/log/rclone" ] || mkdir -p /var/log/rclone
-[ -d "/mnt/gcs_mount/$bucket" ] || mkdir -p /mnt/gcs_mount/$bucket
+[ -d "/mnt/rclone_mount/$bucket" ] || mkdir -p /mnt/rclone_mount/$bucket
 
 [ -e /etc/sysconfig/rclone ] && . /etc/sysconfig/rclone
 
@@ -33,7 +33,7 @@ start() {
     [ -f $REDIS_CONFIG ] || exit 6
     [ -x $exec ] || exit 5
     echo -n $"Starting ${name}@${bucket}: "
-    nohup $exec mount --config $RCLONE_CONFIG --allow-non-empty --allow-other --vfs-cache-max-size 300M --dir-cache-time 24h --vfs-read-chunk-size-limit 128M --vfs-read-chunk-size-limit off --log-level INFO --log-file /var/log/rclone/rclone-${bucket}.log --umask 022 gcp_oss_consul:${bucket} /mnt/gcs_mount/${bucket} >>/var/log/rclone/start_${bucket}.log 2>&1 &
+    nohup $exec mount --config $RCLONE_CONFIG --allow-non-empty --allow-other --vfs-cache-max-size 300M --dir-cache-time 24h --vfs-read-chunk-size-limit 128M --vfs-read-chunk-size-limit off --log-level INFO --log-file /var/log/rclone/rclone-${bucket}.log --umask 022 rclone_oss_consul:${bucket} /mnt/rclone_mount/${bucket} >>/var/log/rclone/start_${bucket}.log 2>&1 &
     retval=$?
     echo
     sleep 1
@@ -50,7 +50,7 @@ start() {
 
 stop() {
     echo -n $"Stopping ${name}@${bucket}: "
-    /bin/fusermount -uz /mnt/gcs_mount/${bucket}
+    /bin/fusermount -uz /mnt/rclone_mount/${bucket}
     retval=$?
 
     sleep 1
